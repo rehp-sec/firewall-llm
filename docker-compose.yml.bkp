@@ -1,0 +1,40 @@
+version: '3.8'
+
+services:
+  # Servicio 1: El Proxy Squid
+  squid:
+    build:
+      context: ./squid
+    ports:
+      - "3128:3128"
+    networks:
+      - proxy-net
+    # Depende de 'python-apps' para asegurar que el ICAP server esté listo
+    depends_on:
+      - python-apps
+    healthcheck:
+      # Revisa que el proceso 'squid' esté corriendo
+      test: ["CMD-SHELL", "squid -k check || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Servicio 2: Tus aplicaciones de Python (ICAP + FastAPI)
+  python-apps:
+    build:
+      context: ./python
+    ports:
+      - "1344:1344" # ICAP
+      - "8081:8081" # Health Check
+    networks:
+      - proxy-net
+    healthcheck:
+      # Revisa el endpoint de health que creaste en FastAPI
+      test: ["CMD", "curl", "-f", "http://localhost:8081/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+networks:
+  proxy-net:
+    driver: bridge

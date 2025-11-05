@@ -1,0 +1,41 @@
+version: '3.8'
+
+services:
+  # Servicio 1: El Proxy Squid (usando tu imagen pre-construida)
+  squid:
+    # --- CORRECCIÓN: Usa la imagen de Docker Hub ---
+    image: rehp/proxy-icap-squid:latest # <-- Reemplaza 'rehp' si tu usuario es otro
+    ports:
+      - "3128:3128"
+    networks:
+      - proxy-net
+    depends_on:
+      - python-apps
+    healthcheck:
+      test: ["CMD-SHELL", "squid -k check || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Servicio 2: Tus aplicaciones de Python (construidas localmente)
+  python-apps:
+    # --- CORRECCIÓN: Construye localmente ---
+    build:
+      context: ./python
+    # --- CORRECCIÓN: Inyecta las variables de entorno ---
+    env_file:
+      - .env
+    ports:
+      - "1344:1344" # ICAP
+      - "8081:8081" # Health Check
+    networks:
+      - proxy-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+networks:
+  proxy-net:
+    driver: bridge
