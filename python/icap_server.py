@@ -1,4 +1,4 @@
-# script2_monitoreo_contraseña.py
+# icap_server.py
 # ICAP REQMOD en modo MONITOREO (no bloquea): siempre ICAP 204 (passthrough)
 # Multi-hilo (ThreadingMixIn) + debounce (QUIET_WINDOW/MAX_WAIT) + dedupe 24h + cooldown
 # Envío de correo FINAL con el mismo formato del script 1
@@ -155,7 +155,7 @@ class Bucket:
         self.first_ts = now
         self.last_seen_ts = now
         self.best_text = ""
-               self.best_len = 0
+        self.best_len = 0
         self.patterns: Set[str] = set()
         self.regdom = regdom
         self.count = 0
