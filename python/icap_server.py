@@ -2,7 +2,7 @@
 # ICAP REQMOD en modo MONITOREO (no bloquea): siempre ICAP 204 (passthrough)
 # Multi-hilo (ThreadingMixIn) + debounce (QUIET_WINDOW/MAX_WAIT) + dedupe 24h + cooldown
 # Envío de correo FINAL con el mismo formato del script 1
-# ÚNICO patrón: \bcontraseña\b
+# Patrones múltiples de credenciales/PII/API keys/tokens (ver BLOCK_PATTERNS)
 
 import collections, collections.abc  # noqa: F401
 if not hasattr(collections, "Callable"):
@@ -34,9 +34,68 @@ except Exception:
 
 # ========= Configuración =========
 
-# Solo patrón de contraseña (insensible a mayúsculas por re.IGNORECASE)
+# Patrones múltiples (insensibles a mayúsculas por re.IGNORECASE)
 BLOCK_PATTERNS = [
+    # === Palabras clave genéricas (Español e Inglés) ===
     r"\bcontraseña\b",
+    r"\bclave\b",
+    r"\bpassword\b",
+    r"\bpasswd\b",
+    r"\bpassphrase\b",
+    r"\bsecreto\b",
+    r"\bsecret\b",
+    r"\btoken\b",
+
+    # === Claves de API y Tokens ===
+    r"\bapi[-_ ]?key\b",
+    r"\bx-api-key\b",
+    r"\bauth[-_ ]?token\b",
+    r"\baccess[-_ ]?token\b",
+    r"\bclient[-_ ]?secret\b",
+    r"authorization\s*:\s*bearer\s+[A-Za-z0-9_\-\.=]{20,}",  # Token Bearer
+    r"\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}",  # JWT (JSON Web Token)
+
+    # === Formatos JSON/YAML comunes para credenciales ===
+    r'"password"\s*:\s*".{4,}"',
+    r'"pass(?:word)?"\s*:\s*".{4,}"',
+    r'"secret"\s*:\s*".{4,}"',
+    r'"api[_-]?key"\s*:\s*".{10,}"',
+    r'"access[_-]?token"\s*:\s*".{10,}"',
+    r'"refresh[_-]?token"\s*:\s*".{10,}"',
+    r'"client[_-]?secret"\s*:\s*".{10,}"',
+
+    # === Claves Privadas (SSH, PGP, etc.) ===
+    r"-----BEGIN (?:RSA|DSA|EC|OPENSSH|PGP) PRIVATE KEY-----",
+
+    # === Claves de proveedores Cloud (AWS, Google, Azure, etc.) ===
+    r"AKIA[0-9A-Z]{16}",                                           # AWS Access Key ID
+    r"(?i)aws_secret_access_key\s*[:=]\s*[A-Za-z0-9/+=]{38,40}",   # AWS Secret Key
+    r"AIza[0-9A-Za-z\-_]{35}",                                      # Google API Key
+    r"\bAccountKey=[A-Za-z0-9+/=]{20,}",                           # Azure Storage Account Key
+    r"\bSharedAccessKey=[A-Za-z0-9+/=]{20,}",                      # Azure SAS Key
+
+    # === Claves de servicios populares (Stripe, GitHub, Slack) ===
+    r"(?:sk|pk)_(?:live|test)_[A-Za-z0-9]{20,}",                   # Stripe API Key
+    r"gh[pousr]_[A-Za-z0-9]{36,}",                                 # GitHub Token
+    r"xox[baprs]-[A-Za-z0-9-]{10,}",                               # Slack Token
+
+    # === Cadenas de conexión a Bases de Datos (con usuario:pass) ===
+    r"\bpostgres(?:ql)?://[^ \n\r]+:[^ \n\r]+@[^ \n\r]+",
+    r"\bmysql://[^ \n\r]+:[^ \n\r]+@[^ \n\r]+",
+    r"\bmongodb(?:\+srv)?:\/\/[^ \n\r]+:[^ \n\r]+@[^ \n\r]+",
+
+    # === Información Personal (Chile) ===
+    # RUT (Rol Único Tributario) con y sin puntos/guión
+    r"\b(?:\d{1,2}\.\d{3}\.\d{3}-[\dkK])\b",                      # Formato: 12.345.678-K
+    r"\b\d{7,8}-[\dkK]\b",                                        # Formato: 12345678-K
+
+    # === Información Financiera (Tarjetas de crédito) ===
+    r"\b4\d{12}(\d{3})?\b",                                       # Visa
+    r"\b5[1-5]\d{14}\b",                                          # MasterCard
+    r"\b3[47]\d{13}\b",                                           # American Express
+
+    # === Otros datos personales ===
+    r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",            # Email (puede ser muy ruidoso)
 ]
 
 # El filtrado de dominios (GenAI/otros) se asume en Squid (ACL/adaptation_access)
@@ -96,7 +155,7 @@ class Bucket:
         self.first_ts = now
         self.last_seen_ts = now
         self.best_text = ""
-        self.best_len = 0
+               self.best_len = 0
         self.patterns: Set[str] = set()
         self.regdom = regdom
         self.count = 0
