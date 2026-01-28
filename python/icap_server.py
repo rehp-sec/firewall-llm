@@ -1,7 +1,7 @@
 # icap_server.py
 # ICAP REQMOD en modo MONITOREO (no bloquea): siempre ICAP 204 (passthrough)
 # Multi-hilo (ThreadingMixIn) + debounce (QUIET_WINDOW/MAX_WAIT) + dedupe 24h + cooldown
-# Envío de correo FINAL con el mismo formato del script 1
+# Notificación FINAL vía webhook (mensaje mínimo solicitado)
 # Patrones múltiples de credenciales/PII/API keys/tokens (ver BLOCK_PATTERNS)
 
 import collections, collections.abc  # noqa: F401
@@ -21,6 +21,10 @@ import ssl
 import threading
 import hashlib
 import unicodedata
+import os
+import socket
+import urllib.request
+import urllib.error
 from email.message import EmailMessage
 from typing import Dict, List, Optional, Tuple, Set
 from datetime import datetime, timezone, timedelta
@@ -118,7 +122,7 @@ DEDUP_TTL_SEC = 24 * 3600          # dedupe global del contenido FINAL
 EARLY_MIN_LEN = 8                  # (no se usa para envío)
 EARLY_COOLDOWN_SEC = 30.0          # (no se usa)
 FINAL_COOLDOWN_SEC = 45.0          # 1 FINAL por dominio+patrón cada 45s
-EMAIL_TEXT_LIMIT = 20000           # máx. caracteres en el correo
+EMAIL_TEXT_LIMIT = 20000           # máx. caracteres en el correo (se mantiene aunque no se use)
 
 # Zona horaria (para mostrar fecha/hora local)
 try:
@@ -127,7 +131,28 @@ try:
 except Exception:
     LOCAL_TZ = timezone(timedelta(hours=-3))  # fallback
 
-# ====== SMTP (formato de envío igual al script 1) ======
+# ====== WEBHOOK (FINAL) ======
+#  - WEBHOOK_URLS: 1 o más URLs separadas por coma
+#  - WEBHOOK_TIMEOUT: segundos
+#  - WEBHOOK_RETRIES: reintentos
+#  - WEBHOOK_BACKOFF_SEC: backoff lineal simple
+#  - WEBHOOK_AUTH: header Authorization opcional (ej: "Bearer XXX")
+#  - WEBHOOK_INSECURE=1: desactiva verificación TLS (NO recomendado)
+#  - RESOLVE_SRC_HOSTNAME=1: intenta resolver hostname por reverse DNS (opcional)
+WEBHOOK_URLS = [u.strip() for u in os.getenv("WEBHOOK_URLS", "").split(",") if u.strip()]
+WEBHOOK_TIMEOUT = float(os.getenv("WEBHOOK_TIMEOUT", "5"))
+WEBHOOK_RETRIES = int(os.getenv("WEBHOOK_RETRIES", "2"))
+WEBHOOK_BACKOFF_SEC = float(os.getenv("WEBHOOK_BACKOFF_SEC", "0.5"))
+WEBHOOK_AUTH = os.getenv("WEBHOOK_AUTH", "").strip()
+WEBHOOK_INSECURE = os.getenv("WEBHOOK_INSECURE", "0").strip().lower() in ("1", "true", "yes", "y", "on")
+RESOLVE_SRC_HOSTNAME = os.getenv("RESOLVE_SRC_HOSTNAME", "0").strip().lower() in ("1", "true", "yes", "y", "on")
+
+_WEBHOOK_SSL_CONTEXT = ssl.create_default_context()
+if WEBHOOK_INSECURE:
+    _WEBHOOK_SSL_CONTEXT.check_hostname = False
+    _WEBHOOK_SSL_CONTEXT.verify_mode = ssl.CERT_NONE
+
+# ====== SMTP (se mantiene, pero ya NO se usa en este modo) ======
 SMTP_HOST = "in-v3.mailjet.com"
 SMTP_PORT = 587
 SMTP_USER = "ce476ee29f90a8780a68d299b5799d69"
@@ -145,6 +170,11 @@ _rx_compiled = [(pat, re.compile(pat, re.IGNORECASE)) for pat in BLOCK_PATTERNS]
 _buckets_lock = threading.Lock()
 _dedupe_lock = threading.Lock()
 _cooldown_lock = threading.Lock()
+
+_dns_lock = threading.Lock()
+_DNS_CACHE: Dict[str, Tuple[float, str]] = {}  # ip -> (ts, hostname)
+DNS_TTL_SEC = 6 * 3600  # cache reverse DNS por 6h
+
 
 class Bucket:
     __slots__ = ("first_ts", "last_seen_ts", "best_text", "best_len",
@@ -390,7 +420,7 @@ def _extract_candidate_text(raw_text: str) -> str:
     return _maybe_unescape_json_string(collected[0])
 
 def _send_email(subject: str, body_text: str) -> None:
-    # Forma de envío como en script 1
+    # Forma de envío como en script 1 (SE MANTIENE, pero no se usa en este modo)
     if not SMTP_USER or not SMTP_PASSWORD:
         log("[icap] SMTP deshabilitado: falta SMTP_USER/SMTP_PASSWORD")
         return
@@ -408,6 +438,71 @@ def _send_email(subject: str, body_text: str) -> None:
 
 def _now_str_local() -> str:
     return datetime.now(LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S %z")
+
+def _resolve_hostname(ip: str) -> str:
+    if not RESOLVE_SRC_HOSTNAME:
+        return ""
+    if not ip:
+        return ""
+    now = time.time()
+    with _dns_lock:
+        v = _DNS_CACHE.get(ip)
+        if v:
+            ts, hn = v
+            if (now - ts) < DNS_TTL_SEC:
+                return hn
+    hn = ""
+    try:
+        # gethostbyaddr puede bloquear; por defecto está deshabilitado salvo RESOLVE_SRC_HOSTNAME=1
+        hn = socket.gethostbyaddr(ip)[0] or ""
+    except Exception:
+        hn = ""
+    with _dns_lock:
+        _DNS_CACHE[ip] = (now, hn)
+        # limpieza ligera
+        if len(_DNS_CACHE) > 5000:
+            cutoff = now - DNS_TTL_SEC
+            for k in list(_DNS_CACHE.keys()):
+                if _DNS_CACHE[k][0] < cutoff:
+                    del _DNS_CACHE[k]
+    return hn
+
+def _send_webhook_text(text: str) -> None:
+    if not WEBHOOK_URLS:
+        log("[icap] webhook deshabilitado: falta WEBHOOK_URLS")
+        return
+
+    payload = {"text": text}  # Slack-compatible; muchos receptores aceptan este formato
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+    headers = {
+        "Content-Type": "application/json; charset=utf-8",
+        "User-Agent": "icap-server/1.0",
+    }
+    if WEBHOOK_AUTH:
+        headers["Authorization"] = WEBHOOK_AUTH
+
+    tries = max(1, WEBHOOK_RETRIES)
+    last_err: Optional[Exception] = None
+    for attempt in range(1, tries + 1):
+        for url in WEBHOOK_URLS:
+            req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+            try:
+                with urllib.request.urlopen(req, timeout=WEBHOOK_TIMEOUT, context=_WEBHOOK_SSL_CONTEXT) as resp:
+                    code = getattr(resp, "status", resp.getcode())
+                    if 200 <= int(code) < 300:
+                        continue
+                    raise RuntimeError(f"HTTP {code}")
+            except Exception as e:
+                last_err = e
+        if last_err is None:
+            return
+        if attempt < tries:
+            time.sleep(WEBHOOK_BACKOFF_SEC * attempt)
+
+    if last_err is not None:
+        raise last_err
+
 
 # ========= Buckets y workers =========
 
@@ -463,41 +558,24 @@ def _cooldown_allowed(kind: str, key: str, window_sec: float) -> bool:
 def _format_email(kind: str, regdom: str, patterns: List[str], text: str, alert_hash: Optional[str], bucket: Bucket) -> Tuple[str, str]:
     """
     kind ∈ {"PRELIMINAR", "FINAL"} — Solo usamos "FINAL".
-    Formato idéntico al script 1 (incluye hash e IPs).
+    En este modo, el "body" se reduce al mensaje mínimo solicitado para webhook.
+    (Se mantiene el nombre/estructura para no cambiar el resto del flujo.)
     """
     pat_main = patterns[0] if patterns else "patrón"
     plus = f" (+{len(patterns)-1})" if len(patterns) > 1 else ""
     subject = f"{EMAIL_SUBJECT_PREFIX} {kind} · {regdom or 'desconocido'} · {pat_main}{plus}"
 
-    txt = text.strip()
-    if len(txt) > EMAIL_TEXT_LIMIT:
-        txt = txt[:EMAIL_TEXT_LIMIT] + "\n[...truncado...]"
-
-    hash_line = f"Hash alerta: {alert_hash}\n" if alert_hash else ""
-
-    src_ip_line = "IP(s) de origen: "
+    # Fuente: primera IP conocida; opcionalmente hostname por reverse DNS
+    src = "desconocida"
     if bucket.src_ips:
-        src_ip_line += ", ".join(sorted(bucket.src_ips)) + "\n"
-    else:
-        src_ip_line += "desconocida\n"
+        ip = sorted(bucket.src_ips)[0]
+        hn = _resolve_hostname(ip)
+        src = f"{ip} ({hn})" if hn else ip
 
     body = (
-        f"Alerta ICAP – Posible filtración de información confidencial ({kind})\n\n"
-        f"Fecha/Hora: {_now_str_local()}\n"
-        f"Dominio solicitado: {regdom or 'desconocido'}\n"
-        f"{src_ip_line}"
-        f"{hash_line}"
-        f"Patrones activados ({len(patterns)}):\n" +
-        "".join([f" - {p}\n" for p in patterns]) +
-        "\nTexto detectado (PLANO):\n"
-        "----------------------------------------\n"
-        f"{txt}\n"
-        "----------------------------------------\n\n"
+        f"Posible Filtración de información por medio de IA detectada ({regdom or 'desconocido'}), "
+        f"filtración detectada desde {src}."
     )
-
-    if kind == "FINAL":
-        dur = max(0.0, time.time() - bucket.first_ts)
-        body += "Alerta ICAP\n"
 
     return subject, body
 
@@ -545,10 +623,10 @@ def _flush_worker():
                     SESSION_BUCKETS.pop(sk, None)
                 continue
 
-            # Enviar correo FINAL
+            # Enviar webhook FINAL (mensaje mínimo)
             subject, body = _format_email("FINAL", regdom, pats, text, alert_hash, b)
             try:
-                _send_email(subject, body)
+                _send_webhook_text(body)
                 with _dedupe_lock:
                     DEDUP_CACHE[alert_hash] = time.time()
                     if len(DEDUP_CACHE) > 10000:
@@ -556,9 +634,9 @@ def _flush_worker():
                         for k in list(DEDUP_CACHE.keys()):
                             if DEDUP_CACHE[k] < cutoff:
                                 del DEDUP_CACHE[k]
-                log("[icap] alerta FINAL enviada por correo")
+                log("[icap] alerta FINAL enviada por webhook")
             except Exception as e:
-                log(f"[icap] error al enviar FINAL: {e!r}")
+                log(f"[icap] error al enviar FINAL por webhook: {e!r}")
             finally:
                 with _buckets_lock:
                     SESSION_BUCKETS.pop(sk, None)
